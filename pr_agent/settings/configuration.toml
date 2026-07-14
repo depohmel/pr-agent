@@ -72,6 +72,11 @@ extended_thinking_max_output_tokens = 4096
 # When non-empty, this list fully replaces the built-in defaults (see CLAUDE_EXTENDED_THINKING_MODELS
 # in pr_agent/algo/__init__.py). Leave empty to use the defaults.
 claude_extended_thinking_models_override = []
+
+# Nemotron reasoning models (LiteLLM model names) that need a system prompt trigger
+# to enable reasoning mode. The trigger text is prepended to the system prompt.
+nemotron_reasoning_models = ["openai/large", "openai/large-reviewer"]
+nemotron_reasoning_trigger = "detailed thinking on"
 # Extract issue number from PR source branch name (e.g. feature/1-auth-google -> issue #1). When true, branch-derived
 # issue URLs are merged with tickets from the PR description for compliance. Set to false to restore description-only behaviour.
 # Note: Branch-name extraction is GitHub-only for now; other providers planned for later.

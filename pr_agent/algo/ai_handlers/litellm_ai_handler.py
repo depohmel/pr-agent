@@ -11,6 +11,7 @@ from tenacity import (retry, retry_if_exception_type,
                       retry_if_not_exception_type, stop_after_attempt)
 
 from pr_agent.algo import (CLAUDE_EXTENDED_THINKING_MODELS,
+                           NEMOTRON_REASONING_MODELS,
                            NO_SUPPORT_TEMPERATURE_MODELS,
                            STREAMING_REQUIRED_MODELS,
                            SUPPORT_REASONING_EFFORT_MODELS,
@@ -357,6 +358,28 @@ class LiteLLMAIHandler(BaseAiHandler):
 
         return kwargs
 
+    def _apply_nemotron_trigger(self, model: str, system: str) -> str:
+        """
+        Apply Nemotron reasoning trigger to system prompt if model is a Nemotron reasoning model.
+
+        Nemotron models (e.g., Nemotron 3 Ultra via LiteLLM names "openai/large",
+        "openai/large-reviewer") only enable reasoning when the system message
+        starts with a specific trigger phrase.
+
+        Args:
+            model (str): The AI model being used
+            system (str): The system prompt
+
+        Returns:
+            str: System prompt with trigger prepended if applicable
+        """
+        trigger = get_settings().config.nemotron_reasoning_trigger
+        if system is None:
+            system = ""
+        if model in get_settings().config.nemotron_reasoning_models and not system.startswith(trigger):
+            return f"{trigger}\n\n{system}"
+        return system
+
     def add_litellm_callbacks(self, kwargs) -> dict:
         captured_extra = []
 
@@ -506,6 +529,8 @@ class LiteLLMAIHandler(BaseAiHandler):
                         provider_prefix = 'openai/'
                     model = provider_prefix + model_base.replace('_thinking', '')  # remove _thinking suffix
 
+                # Apply Nemotron reasoning trigger on the normal path (not user_message_only/custom_reasoning_model)
+                system = self._apply_nemotron_trigger(model, system)
 
                 # Currently, some models do not support a separate system and user prompts
                 if model in self.user_message_only_models or get_settings().config.custom_reasoning_model:
