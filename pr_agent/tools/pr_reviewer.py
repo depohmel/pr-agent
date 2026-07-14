@@ -180,15 +180,33 @@ class PRReviewer:
                 get_settings().data = {"artifact": pr_review}
                 return
 
-            # publish the review
+# publish the review
             if get_settings().pr_reviewer.persistent_comment and not self.incremental.is_incremental:
                 final_update_message = get_settings().pr_reviewer.final_update_message
                 self.git_provider.publish_persistent_comment(pr_review,
-                                                            initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
-                                                            update_header=True,
-                                                            final_update_message=final_update_message, )
+                                                             initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
+                                                             update_header=True,
+                                                             final_update_message=final_update_message, )
             else:
                 self.git_provider.publish_comment(pr_review)
+
+            # Review gate: post a formal GitHub review if enabled
+            if get_settings().pr_reviewer.get("enable_review_gate", False):
+                # Check if we are using GitHub provider
+                if self.git_provider.__class__.__name__ == "GithubProvider":
+                    event, body = self._get_review_gate_decision()
+                    if event == "APPROVE":
+                        try:
+                            self.git_provider.create_review(event="APPROVE")
+                            get_logger().info("Review gate: APPROVED")
+                        except Exception as e:
+                            get_logger().exception(f"Failed to post APPROVE review: {e}")
+                    elif event == "REQUEST_CHANGES":
+                        try:
+                            self.git_provider.request_changes(body)
+                            get_logger().info("Review gate: REQUEST_CHANGES")
+                        except Exception as e:
+                            get_logger().exception(f"Failed to post REQUEST_CHANGES review: {e}")
 
             self.git_provider.remove_initial_comment()
         except Exception as e:
@@ -245,9 +263,8 @@ class PRReviewer:
         first_key = 'review'
         last_key = 'security_concerns'
         data = load_yaml(self.prediction.strip(),
-                         keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "security_concerns:", "key_issues_to_review:",
-                                        "relevant_file:", "relevant_line:", "suggestion:"],
-                         first_key=first_key, last_key=last_key)
+                          keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "security_concerns:", "key_issues_to_review:", "relevant_file:", "relevant_line:", "suggestion:"],
+                          first_key=first_key, last_key=last_key)
         github_action_output(data, 'review')
 
         if 'review' not in data:
@@ -259,6 +276,9 @@ class PRReviewer:
             key_issues_to_review = data['review'].pop('key_issues_to_review')
             data['review']['key_issues_to_review'] = key_issues_to_review
 
+        # Store the parsed data for potential use in the review gate
+        self.parsed_review_data = data
+
         incremental_review_markdown_text = None
         # Add incremental review section
         if self.incremental.is_incremental:
@@ -267,9 +287,9 @@ class PRReviewer:
             incremental_review_markdown_text = f"Starting from commit {last_commit_url}"
 
         markdown_text = convert_to_markdown_v2(data, self.git_provider.is_supported("gfm_markdown"),
-                                            incremental_review_markdown_text,
-                                               git_provider=self.git_provider,
-                                               files=self.git_provider.get_diff_files())
+                                             incremental_review_markdown_text,
+                                                git_provider=self.git_provider,
+                                                files=self.git_provider.get_diff_files())
 
         # Add help text if gfm_markdown is supported
         if self.git_provider.is_supported("gfm_markdown") and get_settings().pr_reviewer.enable_help_text:
@@ -288,7 +308,39 @@ class PRReviewer:
             markdown_text = ""
 
         return markdown_text
+    def _get_review_gate_decision(self):
+        """
+        Determine the review gate decision based on the parsed review data.
+        Returns a tuple (event, body) where event is either "APPROVE" or "REQUEST_CHANGES",
+        and body is the review body (for REQUEST_CHANGES) or None (for APPROVE).
+        Returns (None, None) if the gate is disabled or if we cannot determine.
+        """
+        if not get_settings().pr_reviewer.get("enable_review_gate", False):
+            return (None, None)
+        
+        review_data = getattr(self, 'parsed_review_data', {})
+        review_section = review_data.get('review', {})
+        key_issues = review_section.get('key_issues_to_review', [])
+        security_concerns = review_section.get('security_concerns', '')
+        security_concerns_bool = 'yes' in security_concerns.lower() or 'true' in security_concerns.lower()
 
+        if not key_issues and not security_concerns_bool:
+            return ("APPROVE", None)
+        else:
+            # Prepare a summary of the issues
+            issue_summary = []
+            if key_issues:
+                issue_summary.append("### Key Issues Found")
+                for issue in key_issues:
+                    issue_summary.append(f"- {issue}")
+            if security_concerns_bool:
+                issue_summary.append("\n### Security Concern")
+                issue_summary.append("The review flagged a possible security concern that needs to be addressed.")
+            
+            body = "\n".join(issue_summary)
+            if not body:
+                body = "The review found issues that need to be addressed before merging."
+            return ("REQUEST_CHANGES", body)
     def _get_user_answers(self) -> Tuple[str, str]:
         """
         Retrieves the question and answer strings from the discussion messages related to a pull request.
