@@ -216,6 +216,8 @@ enable_review_coverage_footer=true
 # into chunks, review each chunk, and merge the per-chunk results into one review.
 enable_large_pr_chunking=false
 max_number_of_calls=3 # maximum number of chunk review calls, used only when enable_large_pr_chunking is true
+# review gate
+enable_review_gate = false # When true, the reviewer will post a formal GitHub review (APPROVE or REQUEST_CHANGES) based on the verdict.
 
 [pr_description] # /describe #
 publish_labels=false
