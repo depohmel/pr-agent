@@ -1296,6 +1296,16 @@ class GithubProvider(GitProvider):
             get_logger().exception(f"Failed to auto-approve, error: {e}")
             return False
 
+    def request_changes(self, body: str) -> bool:
+        try:
+            res = self.pr.create_review(body=body, event="REQUEST_CHANGES")
+            if res.state == "CHANGES_REQUESTED":
+                return True
+            return False
+        except Exception as e:
+            get_logger().exception(f"Failed to request changes, error: {e}")
+            return False
+
     def calc_pr_statistics(self, pull_request_data: dict):
             return {}
 
