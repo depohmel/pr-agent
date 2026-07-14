@@ -393,3 +393,11 @@ CLAUDE_EXTENDED_THINKING_MODELS = list(_claude_extended_thinking)
 STREAMING_REQUIRED_MODELS = [
     "openai/qwq-plus"
 ]
+
+# Nemotron reasoning models that require a system prompt trigger to enable reasoning.
+# These models (e.g., Nemotron 3 Ultra via LiteLLM) only activate reasoning when the
+# system message begins with a specific trigger phrase.
+NEMOTRON_REASONING_MODELS = [
+    "openai/large",
+    "openai/large-reviewer",
+]
