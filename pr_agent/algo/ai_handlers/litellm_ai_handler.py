@@ -45,6 +45,7 @@ from pr_agent.algo import (
     GPT6_OPENROUTER_ROUTING_SUFFIXES,
     GPT6_SOL_TIER_MODELS,
     GROK_REASONING_EFFORT_LEVELS,
+    NEMOTRON_REASONING_MODELS,
     STREAMING_REQUIRED_MODELS,
     USER_MESSAGE_ONLY_MODELS,
     normalize_litellm_model,
@@ -2553,6 +2554,28 @@ class LiteLLMAIHandler(BaseAiHandler):
 
         return captured_extra[0] if len(captured_extra) > 0 else {}
 
+    def _apply_nemotron_trigger(self, model: str, system: str) -> str:
+        """
+        Apply Nemotron reasoning trigger to system prompt if model is a Nemotron reasoning model.
+
+        Nemotron models (e.g., Nemotron 3 Ultra via LiteLLM names "openai/large",
+        "openai/large-reviewer") only enable reasoning when the system message
+        starts with a specific trigger phrase.
+
+        Args:
+            model (str): The AI model being used
+            system (str): The system prompt
+
+        Returns:
+            str: System prompt with trigger prepended if applicable
+        """
+        trigger = getattr(get_settings().config, "nemotron_reasoning_trigger", "")
+        if system is None:
+            system = ""
+        if model in getattr(get_settings().config, "nemotron_reasoning_models", []) and not system.startswith(trigger):
+            return f"{trigger}\n\n{system}"
+        return system
+
     def add_litellm_callbacks(self, kwargs) -> dict:
         context = self._capture_log_context(
             "litellm_callbacks_probe", "Capturing logs for litellm callbacks",
@@ -2976,6 +2999,9 @@ class LiteLLMAIHandler(BaseAiHandler):
                         }
                     model_family = "GPT-6" if is_gpt6_model else "GPT-5"
                     get_logger().info(f"Using reasoning_effort='{effort}' for {model_family} model")
+                # Apply Nemotron reasoning trigger on the normal path (not user_message_only/custom_reasoning_model)
+                system = self._apply_nemotron_trigger(model, system)
+
                 # Currently, some models do not support a separate system and user prompts
                 if self._uses_user_message_only(model) or get_settings().config.custom_reasoning_model:
                     user = f"{system}\n\n\n{user}"
