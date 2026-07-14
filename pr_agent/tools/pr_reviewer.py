@@ -1475,7 +1475,28 @@ class PRReviewer:
         review_section = review_data.get('review', {})
         key_issues = review_section.get('key_issues_to_review', [])
         security_concerns = review_section.get('security_concerns', '')
-        security_concerns_bool = 'yes' in security_concerns.lower() or 'true' in security_concerns.lower()
+
+        # Normalize key_issues: treat None, empty string, "[]", "{}" as empty list.
+        # Also, if it's a string that is not one of the empty representations, we wrap it in a list to avoid iterating over characters.
+        if key_issues is None:
+            key_issues = []
+        elif isinstance(key_issues, str):
+            stripped = key_issues.strip()
+            if stripped in ["", "[]", "{}"]:
+                key_issues = []
+            else:
+                # Wrap the string in a list so we can iterate safely (one element)
+                key_issues = [key_issues]
+        elif not isinstance(key_issues, list):
+            # If it's not a list or string, wrap in a list (e.g., if it's a dict, int, etc.)
+            key_issues = [key_issues]
+
+        # Normalize security_concerns to string safely
+        if security_concerns is None:
+            security_concerns_str = ''
+        else:
+            security_concerns_str = str(security_concerns)
+        security_concerns_bool = 'yes' in security_concerns_str.lower() or 'true' in security_concerns_str.lower()
 
         if not key_issues and not security_concerns_bool:
             return ("APPROVE", None)
@@ -1485,7 +1506,14 @@ class PRReviewer:
             if key_issues:
                 issue_summary.append("### Key Issues Found")
                 for issue in key_issues:
-                    issue_summary.append(f"- {issue}")
+                    if isinstance(issue, dict):
+                        relevant_file = issue.get('relevant_file', 'N/A')
+                        issue_header = issue.get('issue_header', 'Issue')
+                        issue_content = issue.get('issue_content', 'No description')
+                        issue_summary.append(f"- **{issue_header}** ({relevant_file}): {issue_content}")
+                    else:
+                        # If it's not a dict, convert to string
+                        issue_summary.append(f"- {str(issue)}")
             if security_concerns_bool:
                 issue_summary.append("\n### Security Concern")
                 issue_summary.append("The review flagged a possible security concern that needs to be addressed.")
