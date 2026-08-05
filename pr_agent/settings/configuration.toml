@@ -59,6 +59,12 @@ ignore_pr_labels = [] # labels to ignore from PR agent when an PR is created
 ignore_pr_authors = [] # authors to ignore from PR agent when an PR is created
 ignore_repositories = [] # a list of regular expressions of repository full names (e.g. "org/repo") to ignore from PR agent processing
 ignore_language_framework = [] # a list of code-generation languages or frameworks (e.g. 'protobuf', 'go_gen') whose auto-generated source files will be excluded from analysis
+# Substring indicators used to skip bot users on webhook events. Currently consumed by
+# the GitLab webhook (`is_bot_user`); other providers may adopt this list in future.
+# The match is case-insensitive against the sender's display name. Overriding this
+# setting REPLACES the default list — include the entries below in your override if
+# you want to keep them (e.g. `["codium", "bot_", "bot-", "_bot", "-bot", "renovate"]`).
+bot_user_indicators = ["codium", "bot_", "bot-", "_bot", "-bot"]
 #
 restricted_mode = false # when true, skip operations that require elevated permissions (e.g. pushing code to the repository)
 is_auto_command = false # will be auto-set to true if the command is triggered by an automation
@@ -348,6 +354,19 @@ success_callback = []
 failure_callback = []
 service_callback = []
 # model_id = "" # Optional: Custom inference profile ID for Amazon Bedrock
+
+[openrouter]
+# OpenRouter provider routing, reasoning control and output cap. These apply only
+# to models addressed as "openrouter/...". The API key and api_base live in
+# .secrets.toml (or the openrouter__key env var); the keys below are non-secret.
+# Refs: https://openrouter.ai/docs/features/provider-routing
+#       https://openrouter.ai/docs/use-cases/reasoning-tokens
+provider_only = [] # restrict routing to these upstream providers only, a hard allowlist (e.g. ["z-ai"]); empty = OpenRouter default routing
+provider_order = [] # preferred provider order; ignored when provider_only is set; empty = unset
+allow_fallbacks = true # when provider_order is set, allow routing beyond the listed providers
+reasoning_effort = "" # "" leaves reasoning to the model default; "none" disables it; otherwise "low", "medium" or "high"
+reasoning_max_tokens = 0 # cap the reasoning budget in tokens; 0 = unset
+max_tokens = 0 # hard cap on completion tokens for the request; 0 = unset
 
 [pr_similar_issue]
 skip_comments = false
