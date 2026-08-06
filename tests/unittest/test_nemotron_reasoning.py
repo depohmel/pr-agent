@@ -16,7 +16,7 @@ def create_mock_settings(models=None, trigger="detailed thinking on"):
             'nemotron_reasoning_models': models,
             'nemotron_reasoning_trigger': trigger,
             'verbosity_level': 0,
-            'get': lambda self, key, default=None: default
+            'get': lambda self, key, default=None: getattr(self, key, default)
         })(),
         'litellm': type('', (), {
             'get': lambda self, key, default=None: default
