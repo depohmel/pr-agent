@@ -2482,10 +2482,10 @@ class LiteLLMAIHandler(BaseAiHandler):
         Returns:
             str: System prompt with trigger prepended if applicable
         """
-        trigger = get_settings().config.nemotron_reasoning_trigger
+        trigger = get_settings().config.get("nemotron_reasoning_trigger", "")
         if system is None:
             system = ""
-        if model in get_settings().config.nemotron_reasoning_models and not system.startswith(trigger):
+        if model in get_settings().config.get("nemotron_reasoning_models", []) and not system.startswith(trigger):
             return f"{trigger}\n\n{system}"
         return system
 
