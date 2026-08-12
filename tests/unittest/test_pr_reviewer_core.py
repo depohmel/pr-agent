@@ -1,3 +1,4 @@
+import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -127,3 +128,158 @@ def test_init_maps_user_question_and_answer_to_correct_prompt_vars(monkeypatch):
 
     assert reviewer.vars["question_str"] == "Questions to better understand the PR:\n- Why?"
     assert reviewer.vars["answer_str"] == "/answer Because it fixes production."
+
+
+@pytest.mark.asyncio
+async def test_run_removes_placeholder_on_failure(monkeypatch):
+    """BUG 1 - when the LLM call raises, the 'Preparing review...' placeholder must
+    still be cleaned up (try/finally). Without the finally block it stays on the
+    PR forever, looking like a hung review.
+    """
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    git_provider = MagicMock()
+    reviewer = _make_reviewer(git_provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.vars = {}
+    reviewer.prediction = None
+
+    async def _noop(*a, **kw):
+        return None
+
+    async def _boom(prepare_fn, model_type=None):
+        raise RuntimeError("LLM explosion")
+
+    monkeypatch.setattr(pr_reviewer_module, "init_run_details", lambda: None)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", _noop)
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", _boom)
+
+    settings = get_settings()
+    original = {
+        "publish_output": settings.config.publish_output,
+        "is_auto_command": settings.config.get("is_auto_command", False),
+    }
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+
+        await reviewer.run()
+    finally:
+        settings.config.publish_output = original["publish_output"]
+        settings.config.is_auto_command = original["is_auto_command"]
+
+    git_provider.publish_comment.assert_any_call("Preparing review...", is_temporary=True)
+    git_provider.remove_initial_comment.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_dismisses_stale_change_requests_on_clean_review(monkeypatch):
+    """BUG 2 - a fresh review that finds no key issues and no security concerns
+    dismisses the bot's own prior CHANGES_REQUESTED reviews so the gate can clear.
+    """
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    git_provider = MagicMock()
+    reviewer = _make_reviewer(git_provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.vars = {}
+    reviewer.prediction = None
+    reviewer.review_data = {"review": {"key_issues_to_review": [], "security_concerns": "No"}}
+
+    async def _noop(*a, **kw):
+        return None
+
+    async def _fake_retry(prepare_fn, model_type=None):
+        reviewer.prediction = "review: {}"
+
+    monkeypatch.setattr(pr_reviewer_module, "init_run_details", lambda: None)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", _noop)
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", _fake_retry)
+
+    review_text = "## PR Reviewer Guide\n\nNo major issues detected"
+    reviewer._prepare_pr_review = lambda: review_text
+
+    settings = get_settings()
+    original = {
+        "publish_output": settings.config.publish_output,
+        "is_auto_command": settings.config.get("is_auto_command", False),
+        "persistent_comment": settings.pr_reviewer.persistent_comment,
+    }
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+        settings.pr_reviewer.persistent_comment = False
+
+        await reviewer.run()
+    finally:
+        settings.config.publish_output = original["publish_output"]
+        settings.config.is_auto_command = original["is_auto_command"]
+        settings.pr_reviewer.persistent_comment = original["persistent_comment"]
+
+    git_provider.dismiss_stale_changes_requested_reviews.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_dismiss_when_review_has_issues(monkeypatch):
+    """When the review has key issues or security concerns, stale CHANGES_REQUESTED
+    reviews are NOT dismissed - the gate should stay red until issues are fixed.
+    """
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    git_provider = MagicMock()
+    reviewer = _make_reviewer(git_provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.vars = {}
+    reviewer.prediction = None
+    reviewer.review_data = {
+        "review": {"key_issues_to_review": [{"file": "a.py"}], "security_concerns": "Yes"},
+    }
+
+    async def _noop(*a, **kw):
+        return None
+
+    async def _fake_retry(prepare_fn, model_type=None):
+        reviewer.prediction = "review: {}"
+
+    monkeypatch.setattr(pr_reviewer_module, "init_run_details", lambda: None)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", _noop)
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", _fake_retry)
+
+    review_text = "## PR Reviewer Guide\n\nFound a bug"
+    reviewer._prepare_pr_review = lambda: review_text
+
+    settings = get_settings()
+    original = {
+        "publish_output": settings.config.publish_output,
+        "is_auto_command": settings.config.get("is_auto_command", False),
+        "persistent_comment": settings.pr_reviewer.persistent_comment,
+    }
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+        settings.pr_reviewer.persistent_comment = False
+
+        await reviewer.run()
+    finally:
+        settings.config.publish_output = original["publish_output"]
+        settings.config.is_auto_command = original["is_auto_command"]
+        settings.pr_reviewer.persistent_comment = original["persistent_comment"]
+
+    git_provider.dismiss_stale_changes_requested_reviews.assert_not_called()
+
+
+def test_review_has_no_key_issues_or_security_concerns():
+    """The helper correctly classifies clean vs. blocking reviews."""
+    reviewer = _make_reviewer()
+
+    reviewer.review_data = {"review": {"key_issues_to_review": [], "security_concerns": "No"}}
+    assert reviewer._review_has_no_key_issues_or_security_concerns() is True
+
+    reviewer.review_data = {"review": {"key_issues_to_review": [], "security_concerns": "Yes, SQL injection"}}
+    assert reviewer._review_has_no_key_issues_or_security_concerns() is False
+
+    reviewer.review_data = {"review": {"key_issues_to_review": [{"file": "a.py"}], "security_concerns": "No"}}
+    assert reviewer._review_has_no_key_issues_or_security_concerns() is False
+
+    reviewer.review_data = None
+    assert reviewer._review_has_no_key_issues_or_security_concerns() is False
