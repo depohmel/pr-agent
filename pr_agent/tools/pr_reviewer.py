@@ -222,6 +222,7 @@ class PRReviewer:
         self._review_finding_previous_state = None
         self._review_state_preserved = False
         previous_findings = self._load_previous_findings_context()
+        self.review_data = None
         question_str, answer_str = self._get_user_answers()
         self.pr_description, self.pr_description_files = (
             self.git_provider.get_pr_description(split_changes_walkthrough=True))
@@ -376,6 +377,12 @@ class PRReviewer:
             state_result = getattr(self, "_review_state_result", None)
             state_changed = bool(state_result and state_result.changed)
             state_blocked = getattr(self, "_review_state_blocked", False)
+
+            # When a fresh review of the current head finds no key issues and no security
+            # concerns, dismiss the bot's own prior CHANGES_REQUESTED reviews so the PR
+            # can become mergeable again. Only the bot's own reviews are ever dismissed.
+            if self._review_has_no_key_issues_or_security_concerns():
+                self.git_provider.dismiss_stale_changes_requested_reviews()
             should_publish = get_settings().config.publish_output and (
                 self._should_publish_review_no_suggestions(pr_review)
                 or state_changed
@@ -894,6 +901,22 @@ class PRReviewer:
             or "No major issues detected" not in pr_review
         )
 
+    def _review_has_no_key_issues_or_security_concerns(self) -> bool:
+        """Return True when the parsed review found no key issues and no security concerns.
+
+        Mirrors the same heuristic used by ``set_review_labels``: an empty/
+        missing ``key_issues_to_review`` list and a ``security_concerns`` string
+        that does not contain "yes" or "true".
+        """
+        review = (getattr(self, "review_data", None) or {}).get("review") or {}
+        key_issues = review.get("key_issues_to_review")
+        has_key_issues = bool(key_issues) if isinstance(key_issues, list) else False
+        security_concerns = review.get("security_concerns") or ""
+        has_security = (
+            "yes" in security_concerns.lower() or "true" in security_concerns.lower()
+        )
+        return not has_key_issues and not has_security
+
     async def _prepare_prediction(self, model: str) -> None:
         # Each model attempt owns a fresh result. A malformed primary must not
         # leave state that can be mistaken for a successful fallback response.
@@ -1314,6 +1337,7 @@ class PRReviewer:
             self._validate_review_schema(data)
         if isinstance(data, dict) and isinstance(data.get("review"), dict) and "failure_modes" in data["review"]:
             data["review"]["failure_modes"] = parse_failure_modes(data["review"]["failure_modes"])
+        self.review_data = data
         github_action_output(data, 'review')
 
         if not isinstance(data, dict) or not isinstance(data.get('review'), dict) or not data['review']:
