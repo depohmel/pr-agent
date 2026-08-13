@@ -65,6 +65,7 @@ class PRReviewer:
         self.ai_handler.main_pr_language = self.main_language
         self.patches_diff = None
         self.prediction = None
+        self.review_data = None
         question_str, answer_str = self._get_user_answers()
         self.pr_description, self.pr_description_files = (
             self.git_provider.get_pr_description(split_changes_walkthrough=True))
@@ -165,11 +166,16 @@ class PRReviewer:
 
             await retry_with_fallback_models(self._prepare_prediction, model_type=ModelType.REGULAR)
             if not self.prediction:
-                self.git_provider.remove_initial_comment()
                 return None
 
             pr_review = self._prepare_pr_review()
             get_logger().debug(f"PR output", artifact=pr_review)
+
+            # When a fresh review of the current head finds no key issues and no security
+            # concerns, dismiss the bot's own prior CHANGES_REQUESTED reviews so the PR
+            # can become mergeable again. Only the bot's own reviews are ever dismissed.
+            if self._review_has_no_key_issues_or_security_concerns():
+                self.git_provider.dismiss_stale_changes_requested_reviews()
 
             should_publish = get_settings().config.publish_output and self._should_publish_review_no_suggestions(pr_review)
             if not should_publish:
@@ -181,14 +187,19 @@ class PRReviewer:
                 return
 
 # publish the review
+            # publish the review
+            # Providers that support it (GitLab) can post the review's final comment as a resolvable thread.
+            # This intent applies to the review only - never to status comments or the output of other tools.
+            review_thread_kwargs = {"as_thread": True} if self.git_provider.should_publish_review_as_thread() else {}
             if get_settings().pr_reviewer.persistent_comment and not self.incremental.is_incremental:
                 final_update_message = get_settings().pr_reviewer.final_update_message
                 self.git_provider.publish_persistent_comment(pr_review,
-                                                             initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
-                                                             update_header=True,
-                                                             final_update_message=final_update_message, )
+                                                            initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
+                                                            update_header=True,
+                                                            final_update_message=final_update_message,
+                                                            **review_thread_kwargs)
             else:
-                self.git_provider.publish_comment(pr_review)
+                self.git_provider.publish_comment(pr_review, **review_thread_kwargs)
 
             # Review gate: post a formal GitHub review if enabled
             if get_settings().pr_reviewer.get("enable_review_gate", False):
@@ -208,12 +219,34 @@ class PRReviewer:
                         except Exception as e:
                             get_logger().exception(f"Failed to post REQUEST_CHANGES review: {e}")
 
-            self.git_provider.remove_initial_comment()
         except Exception as e:
             get_logger().error(f"Failed to review PR: {e}")
+            if get_settings().config.get("propagate_tool_errors", False):
+                raise
+        finally:
+            # Ensure the 'Preparing review...' placeholder is always cleaned up,
+            # even when the LLM call or downstream publishing fails -- otherwise it
+            # leaves the PR looking hung indefinitely.
+            self.git_provider.remove_initial_comment()
 
     def _should_publish_review_no_suggestions(self, pr_review: str) -> bool:
         return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review
+
+    def _review_has_no_key_issues_or_security_concerns(self) -> bool:
+        """Return True when the parsed review found no key issues and no security concerns.
+
+        Mirrors the same heuristic used by ``set_review_labels``: an empty/
+        missing ``key_issues_to_review`` list and a ``security_concerns`` string
+        that does not contain "yes" or "true".
+        """
+        review = (getattr(self, "review_data", None) or {}).get("review") or {}
+        key_issues = review.get("key_issues_to_review")
+        has_key_issues = bool(key_issues) if isinstance(key_issues, list) else False
+        security_concerns = review.get("security_concerns") or ""
+        has_security = (
+            "yes" in security_concerns.lower() or "true" in security_concerns.lower()
+        )
+        return not has_key_issues and not has_security
 
     async def _prepare_prediction(self, model: str) -> None:
         self.patches_diff = get_pr_diff(self.git_provider,
@@ -263,8 +296,10 @@ class PRReviewer:
         first_key = 'review'
         last_key = 'security_concerns'
         data = load_yaml(self.prediction.strip(),
-                          keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "security_concerns:", "key_issues_to_review:", "relevant_file:", "relevant_line:", "suggestion:"],
-                          first_key=first_key, last_key=last_key)
+                         keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "security_concerns:", "key_issues_to_review:",
+                                        "relevant_file:", "relevant_line:", "suggestion:"],
+                         first_key=first_key, last_key=last_key)
+        self.review_data = data
         github_action_output(data, 'review')
 
         if 'review' not in data:
