@@ -374,3 +374,67 @@ def test_publish_code_suggestions_returns_false_on_publish_error():
         "relevant_lines_start": 1, "relevant_lines_end": 2,
     }])
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# dismiss_stale_changes_requested_reviews
+# ---------------------------------------------------------------------------
+
+class _FakeReview:
+    """Minimal stand-in for a PyGithub PullRequestReview."""
+
+    def __init__(self, review_id, state, user_login, commit_id):
+        self.id = review_id
+        self.state = state
+        self.user = SimpleNamespace(login=user_login)
+        self.commit_id = commit_id
+        self.dismiss_call = None
+
+    def dismiss(self, message):
+        self.dismiss_call = message
+
+
+class _FakeReviewsPR:
+    """Fake PR exposing head.sha and get_reviews() for dismissal tests."""
+
+    def __init__(self, reviews, head_sha="abc123"):
+        self._reviews = reviews
+        self.head = SimpleNamespace(sha=head_sha)
+
+    def get_reviews(self):
+        return self._reviews
+
+
+def test_dismiss_stale_changes_requested_reviews_only_dismisses_bot_reviews():
+    """Only CHANGES_REQUESTED reviews authored by the bot are dismissed;
+    human reviews and non-CHANGES_REQUESTED states are left untouched."""
+    bot_stale = _FakeReview(1, "CHANGES_REQUESTED", "sovereign-codereviewer[bot]", "oldcommit1")
+    bot_current = _FakeReview(2, "CHANGES_REQUESTED", "sovereign-codereviewer[bot]", "abc123")
+    human = _FakeReview(3, "CHANGES_REQUESTED", "human-user", "oldcommit2")
+    approved = _FakeReview(4, "APPROVED", "sovereign-codereviewer[bot]", "oldcommit3")
+
+    pr = _FakeReviewsPR([bot_stale, bot_current, human, approved])
+    provider = _make_provider(pr=pr)
+    provider.get_user_id = lambda: "sovereign-codereviewer[bot]"
+
+    dismissed = provider.dismiss_stale_changes_requested_reviews()
+
+    assert dismissed == 2  # bot_stale and bot_current
+    assert bot_stale.dismiss_call is not None
+    assert bot_current.dismiss_call is not None
+    assert human.dismiss_call is None
+    assert approved.dismiss_call is None
+    # The dismiss message names the current commit
+    assert "abc123" in bot_stale.dismiss_call
+    assert "abc123" in bot_current.dismiss_call
+
+
+def test_dismiss_stale_changes_requested_reviews_returns_zero_when_bot_login_unknown():
+    """If the bot cannot identify itself, nothing is dismissed."""
+    pr = _FakeReviewsPR([_FakeReview(1, "CHANGES_REQUESTED", "bot", "old")])
+    provider = _make_provider(pr=pr)
+    provider.get_user_id = lambda: ""
+
+    dismissed = provider.dismiss_stale_changes_requested_reviews()
+
+    assert dismissed == 0

@@ -14,6 +14,7 @@ from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
                                          retry_with_fallback_models)
 from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.repo_context import build_repo_context
+from pr_agent.algo.run_details import init_run_details
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import (ModelType, PRReviewHeader,
                                  convert_to_markdown_v2, github_action_output,
@@ -123,6 +124,7 @@ class PRReviewer:
         return incremental
 
     async def run(self) -> None:
+        init_run_details()
         try:
             if not self.git_provider.get_files():
                 get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
@@ -239,7 +241,12 @@ class PRReviewer:
         missing ``key_issues_to_review`` list and a ``security_concerns`` string
         that does not contain "yes" or "true".
         """
-        review = (getattr(self, "review_data", None) or {}).get("review") or {}
+        review_data = getattr(self, "review_data", None)
+        if not review_data:
+            return False
+        review = review_data.get("review")
+        if not isinstance(review, dict):
+            return False
         key_issues = review.get("key_issues_to_review")
         has_key_issues = bool(key_issues) if isinstance(key_issues, list) else False
         security_concerns = review.get("security_concerns") or ""
