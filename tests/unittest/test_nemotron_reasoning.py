@@ -1,10 +1,8 @@
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import pr_agent.algo.ai_handlers.litellm_ai_handler as litellm_handler
-from pr_agent.algo import NEMOTRON_REASONING_MODELS
 
 
 def create_mock_settings(models=None, trigger="detailed thinking on"):
