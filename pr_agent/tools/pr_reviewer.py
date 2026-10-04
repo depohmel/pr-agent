@@ -1328,7 +1328,7 @@ class PRReviewer:
         """
         if not get_settings().pr_reviewer.get("enable_review_gate", False):
             return (None, None)
-        
+
         review_data = getattr(self, 'parsed_review_data', {})
         review_section = review_data.get('review', {})
         key_issues = review_section.get('key_issues_to_review', [])
@@ -1376,7 +1376,7 @@ class PRReviewer:
             if security_concerns_bool:
                 issue_summary.append("\n### Security Concern")
                 issue_summary.append("The review flagged a possible security concern that needs to be addressed.")
-            
+
             body = "\n".join(issue_summary)
             if not body:
                 body = "The review found issues that need to be addressed before merging."
