@@ -9,18 +9,27 @@ Three paths:
       on the context settings, run the verb via DiffInputProvider.
   (c) free-text with no PR URL and no diff -> honest guidance (ask needs a PR/diff).
 
+Inbound text may be a whole forwarded conversation, one part per turn: "{role}: {content}".
+
 Capture is DEFENSIVE everywhere: get_settings().get("data", {}).get("artifact", "")
 (several tool paths never set it, and handle_request swallows exceptions -> False).
 route_and_run NEVER raises; on failure/empty it returns an honest fallback string."""
-import asyncio
-import ipaddress
 import re
-import socket
+from collections import deque
 from typing import NamedTuple, Optional
-from urllib.parse import urljoin, urlparse
 
 import aiohttp
 
+from pr_agent.agent.request_policy import RequestOutcome
+from pr_agent.algo.language_handler import build_language_file_matcher
+from pr_agent.algo.url_safety import (
+    MAX_SAFE_REDIRECTS,
+    with_safe_redirects,
+)
+from pr_agent.algo.url_safety import (
+    url_is_safe as _url_is_safe,
+)
+from pr_agent.algo.utils import encode_user_text_arg
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 from pr_agent.mosaico.diff_provider import parse_unified_diff
@@ -30,18 +39,41 @@ _DEFAULT_VERB = "review"
 
 _DIFF_FETCH_TIMEOUT_S = 20
 _DIFF_FETCH_MAX_BYTES = 4_000_000  # ~4 MB; larger diffs exceed model context anyway
-_DIFF_FETCH_MAX_REDIRECTS = 5
+_DIFF_FETCH_MAX_REDIRECTS = MAX_SAFE_REDIRECTS
 
 # PR-URL detection: github/gitlab/bitbucket/azure-style hosts with a PR/MR path.
-_PR_URL_RE = re.compile(
-    r"https?://\S*?/(?:pull|pulls|merge_requests|pullrequest|pull-requests|_git/\S+/pullrequest)/\d+",
-    re.IGNORECASE,
-)
+_URL_TOKEN_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_PR_PATH_RE = re.compile(r"/(?:pull|pulls|merge_requests|pullrequest|pull-requests)/\d+", re.IGNORECASE)
+_VERB_TOKEN_RE = re.compile(rf"/?({'|'.join(_VALID_VERBS)})\b")
 
 # Diff detection: a ```diff fence or a raw unified-diff header.
 _DIFF_FENCE_RE = re.compile(r"```\s*diff", re.IGNORECASE)
 _DIFF_HEADER_RE = re.compile(r"^diff --git ", re.MULTILINE)
 _UNIFIED_HUNK_RE = re.compile(r"^@@ .* @@", re.MULTILINE)
+
+_DIFF_START_RE = re.compile(r"^(?:diff --git |@@ )")
+_DIFF_BODY_LINE_RE = re.compile(
+    r"^(?:diff --git |index [0-9a-fA-F]|--- |\+\+\+ |@@ "
+    r"|(?:old|new) mode \d|(?:new|deleted) file mode \d"
+    r"|(?:similarity|dissimilarity) index \d|rename (?:from|to) |copy (?:from|to) "
+    r"|Binary files .*differ$|GIT binary patch$"
+    r"|[ +\-\\]|$)"
+)
+
+# The live label is "agent", not "assistant" — matching only "assistant" is a no-op live.
+_ROLE_LINE_RE = re.compile(r"^(user|agent|assistant)[ \t]*:[ \t]*", re.IGNORECASE)
+_USER_ROLES = ("user",)
+
+_NEGATION_RE = re.compile(
+    r"\b(?:no|not|never|avoid|skip|without|don'?t|do\s+not|instead\s+of|rather\s+than)\b"
+    r"(?:\s+\w+){0,2}\s*/?$",
+    re.IGNORECASE,
+)
+
+# The "not" guard keeps "do not review" an instruction; a real question still has its '?'.
+_QUESTION_OPENER_RE = re.compile(
+    r"\s*(what|why|how|when|where|who|which|is|are|does|do|can|should)\b(?!\s+not\b)", re.IGNORECASE
+)
 
 
 class RouteResult(NamedTuple):
@@ -50,24 +82,102 @@ class RouteResult(NamedTuple):
     ok: bool
 
 
+class _Turn(NamedTuple):
+    role: str
+    content: str
+
+    @property
+    def is_user(self) -> bool:
+        return self.role in _USER_ROLES
+
+
+def _split_turns(text: str) -> list["_Turn"]:
+    """Conservative on purpose: a blob must open with a role label AND carry at least two."""
+    if not text:
+        return []
+    lines = text.split("\n")
+    starts = [i for i, line in enumerate(lines) if _ROLE_LINE_RE.match(line)]
+    if len(starts) < 2:
+        return []
+    first_content = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if starts[0] != first_content:
+        return []
+    turns = []
+    for n, start in enumerate(starts):
+        end = starts[n + 1] if n + 1 < len(starts) else len(lines)
+        m = _ROLE_LINE_RE.match(lines[start])
+        body = "\n".join([lines[start][m.end():]] + lines[start + 1:end])
+        turns.append(_Turn(m.group(1).lower(), body.strip("\n")))
+    return turns
+
+
+def _routing_prefix(text: str) -> str:
+    """Bound detection work without turning a cut token into a different PR/verb."""
+    limit = get_settings().get("MOSAICO.ROUTING_SCAN_MAX_CHARS", 65536)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("mosaico.routing_scan_max_chars must be a positive integer")
+    text = text or ""
+    end = min(len(text), limit)
+    if end < len(text) and not text[end].isspace():
+        while end and not text[end - 1].isspace():
+            end -= 1
+    return text[:end]
+
+
+def _explicit_verb(text: str) -> Optional[str]:
+    """Return the first non-negated command, scanning each whitespace token once."""
+    low = _routing_prefix(text).lower()
+    prior_starts = deque(maxlen=4)
+    for token in re.finditer(r"\S+", low):
+        match = _VERB_TOKEN_RE.match(token.group())
+        if match:
+            at = token.start() + match.start(1)
+            start = prior_starts[0] if prior_starts else token.start()
+            if not _NEGATION_RE.search(low[start:at]):
+                return match.group(1)
+        prior_starts.append(token.start())
+    return None
+
+
+def _reads_as_question(text: str) -> bool:
+    low = (text or "").lower()
+    return "?" in low or bool(_QUESTION_OPENER_RE.match(low))
+
+
 def _detect_verb(text: str) -> str:
     """Pick a verb from the text. Defaults to 'review'. 'ask' wins when the text reads
     like a question and no other explicit verb is present."""
-    low = (text or "").lower()
-    # explicit slash command takes precedence
-    for verb in _VALID_VERBS:
-        if re.search(rf"(^|\s)/?{verb}\b", low):
-            return verb
+    verb = _explicit_verb(text)
+    if verb:
+        return verb
     # heuristic: a question mark or interrogative opener -> ask
-    if "?" in low or re.match(r"\s*(what|why|how|when|where|who|which|is|are|does|do|can|should)\b", low):
+    if _reads_as_question(text):
         return "ask"
     return _DEFAULT_VERB
 
 
+def _resolve_verb(user_segments: list) -> str:
+    prose = [_diff_prose(seg) for seg in user_segments]
+    if not prose:
+        return _DEFAULT_VERB
+    verb = _explicit_verb(prose[0])
+    if verb:
+        return verb
+    if _reads_as_question(prose[0]):
+        return "ask"
+    for older in prose[1:]:
+        verb = _explicit_verb(older)
+        if verb:
+            return verb
+    return _DEFAULT_VERB
+
+
 def _find_pr_url(text: str):
-    m = _PR_URL_RE.search(text or "")
-    if m:
-        return m.group(0)
+    for candidate in _URL_TOKEN_RE.finditer(_routing_prefix(text)):
+        url = candidate.group()
+        path = _PR_PATH_RE.search(url)
+        if path:
+            return url[:path.end()]
     return None
 
 
@@ -79,9 +189,9 @@ def _looks_like_diff(text: str) -> bool:
 
 def _extract_diff(text: str) -> str:
     """Return the unified-diff body, unwrapping a ```diff fence if present."""
-    fence = re.search(r"```\s*diff\s*\n(.*?)```", text, re.IGNORECASE | re.DOTALL)
-    if fence:
-        return fence.group(1)
+    fences = re.findall(r"```\s*diff\s*\n(.*?)```", text, re.IGNORECASE | re.DOTALL)
+    if fences:
+        return fences[-1]
     return text
 
 
@@ -94,9 +204,17 @@ def _diff_prose(text: str) -> str:
     without_fence = re.sub(r"```\s*diff\s*\n.*?```", " ", text, flags=re.IGNORECASE | re.DOTALL)
     if without_fence != text:
         return without_fence
-    # Raw (unfenced) diff: keep only the text before the first diff/hunk header.
-    m = re.search(r"^(?:diff --git |@@ )", text, re.MULTILINE)
-    return text[:m.start()] if m else text
+    kept, in_diff = [], False
+    for line in text.split("\n"):
+        if _DIFF_START_RE.match(line):
+            in_diff = True
+            continue
+        if in_diff:
+            if _DIFF_BODY_LINE_RE.match(line):
+                continue
+            in_diff = False
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def _capture_artifact() -> str:
@@ -118,46 +236,6 @@ def _ask_needs_context_fallback() -> str:
     return "PR-Agent requires a PR URL or a supplied diff."
 
 
-def _ip_is_blocked(addr) -> bool:
-    """Reject non-public IP ranges (SSRF guard): private/loopback/link-local (incl. cloud
-    metadata 169.254.0.0/16), reserved, multicast, unspecified."""
-    return (addr.is_private or addr.is_loopback or addr.is_link_local
-            or addr.is_reserved or addr.is_multicast or addr.is_unspecified)
-
-
-async def _host_resolves_public(host: str) -> bool:
-    """True only if `host` resolves and EVERY resolved IP is public. DNS runs in a thread
-    so it does not block the event loop. Any failure -> False (fail closed)."""
-    if not host:
-        return False
-    try:
-        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
-    except Exception:
-        return False
-    saw = False
-    for info in infos:
-        ip = info[4][0].split("%")[0]  # strip IPv6 zone id
-        try:
-            addr = ipaddress.ip_address(ip)
-        except ValueError:
-            return False
-        saw = True
-        if _ip_is_blocked(addr):
-            return False
-    return saw
-
-
-async def _url_is_safe(url: str) -> bool:
-    """SSRF gate for one URL: https scheme + a hostname that resolves only to public IPs."""
-    try:
-        u = urlparse(url)
-    except Exception:
-        return False
-    if u.scheme != "https" or not u.hostname:
-        return False
-    return await _host_resolves_public(u.hostname)
-
-
 async def _fetch_public_diff(pr_url: str) -> Optional[str]:
     """Fetch the public unified diff for a GitHub/GitLab PR/MR URL by appending '.diff'.
     Returns the diff text, or None on any failure. No auth - public repos only. SSRF-guarded:
@@ -168,35 +246,33 @@ async def _fetch_public_diff(pr_url: str) -> Optional[str]:
     try:
         timeout = aiohttp.ClientTimeout(total=_DIFF_FETCH_TIMEOUT_S)
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            url = diff_url
-            for _ in range(_DIFF_FETCH_MAX_REDIRECTS + 1):
-                if not await _url_is_safe(url):
-                    get_logger().info(f"MOSAICO: diff fetch blocked unsafe/non-public URL: {url}")
+            async def _consume(response, url):
+                if response.status != 200:
+                    get_logger().info(f"MOSAICO: diff fetch {url} -> HTTP {response.status}")
                     return None
-                async with session.get(url, allow_redirects=False) as resp:
-                    if resp.status in (301, 302, 303, 307, 308):
-                        loc = resp.headers.get("Location")
-                        if not loc:
-                            return None
-                        url = urljoin(url, loc)
-                        continue
-                    if resp.status != 200:
-                        get_logger().info(f"MOSAICO: diff fetch {url} -> HTTP {resp.status}")
+                # StreamReader.read(n) returns only buffered bytes; drain in chunks with a cap.
+                chunks = []
+                total = 0
+                async for chunk in response.content.iter_chunked(65536):
+                    total += len(chunk)
+                    if total > _DIFF_FETCH_MAX_BYTES:
+                        get_logger().info(f"MOSAICO: diff fetch {url} exceeds size cap; skipping.")
                         return None
-                    # StreamReader.read(n) returns only buffered bytes; drain in chunks with a cap.
-                    chunks = []
-                    total = 0
-                    async for chunk in resp.content.iter_chunked(65536):
-                        total += len(chunk)
-                        if total > _DIFF_FETCH_MAX_BYTES:
-                            get_logger().info(f"MOSAICO: diff fetch {url} exceeds size cap; skipping.")
-                            return None
-                        chunks.append(chunk)
-                    raw = b"".join(chunks)
-                    text = raw.decode("utf-8", errors="replace")
-                    return text if text.strip() else None
-            get_logger().info(f"MOSAICO: diff fetch exceeded redirect limit: {diff_url}")
-            return None
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
+                text = raw.decode("utf-8", errors="replace")
+                return text if text.strip() else None
+
+            result = await with_safe_redirects(
+                session,
+                diff_url,
+                _consume,
+                max_redirects=_DIFF_FETCH_MAX_REDIRECTS,
+                validator=_url_is_safe,
+            )
+            if result is None:
+                get_logger().info(f"MOSAICO: diff fetch produced no diff for {diff_url}")
+            return result
     except Exception as e:
         get_logger().info(f"MOSAICO: diff fetch failed for {diff_url}: {e}")
         return None
@@ -211,14 +287,21 @@ def _pr_fetch_failed_fallback(pr_url: str) -> str:
 
 async def _run_pr_agent(target: str, verb: str) -> "RouteResult":
     """Run a review/improve/describe verb via PRAgent.handle_request, defensively.
-    Force non-publishing output capture: the tools render into get_settings().data only
-    when publish_output is False; with the default True they'd publish to the real PR and
-    return nothing to MOSAICO."""
+    publish_output=false makes the tools render into get_settings().data instead of the real PR;
+    propagate_tool_errors makes them re-raise, so a failure cannot read back as an empty run."""
     from pr_agent.agent.pr_agent import PRAgent
-    ok = await PRAgent().handle_request(
-        target,
-        ["/" + verb, "--config.publish_output=false", "--config.publish_output_progress=false"],
-    )
+    settings = get_settings()
+    propagate_before = settings.get("CONFIG.PROPAGATE_TOOL_ERRORS", False)
+    try:
+        ok = await PRAgent().handle_request(
+            target,
+            ["/" + verb, "--config.publish_output=false", "--config.publish_output_progress=false",
+             "--config.propagate_tool_errors=true"],
+        )
+    finally:
+        settings.set("CONFIG.PROPAGATE_TOOL_ERRORS", propagate_before)
+    if ok is RequestOutcome.SKIPPED:
+        return RouteResult("Request ignored by policy.", ok=True)
     if ok is False:
         return RouteResult(_error_fallback(verb), ok=False)
     artifact = _capture_artifact()
@@ -226,38 +309,36 @@ async def _run_pr_agent(target: str, verb: str) -> "RouteResult":
 
 
 async def _run_ask(target: str, question: str) -> "RouteResult":
-    """Run the ask path directly via PRQuestions (it uses get_git_provider()(pr_url),
-    not the with-context variant). PRQuestions.run() is NOT wrapped by handle_request's
-    try/except, so wrap it here and treat an exception like a swallowed failure.
-
-    PRQuestions.parse_args() joins args as plain text (no --config.* parsing), so the
-    arg-injection trick used by _run_pr_agent cannot apply here. Instead, force
-    publish_output=False on the per-request settings copy (executor.py deepcopies
-    global_settings into starlette_context, so this write is request-scoped) before
-    constructing PRQuestions — run() reads config.publish_output with no
-    apply_repo_settings call after this point that could re-enable publishing."""
-    from pr_agent.tools.pr_questions import PRQuestions
-    get_settings().set("CONFIG.PUBLISH_OUTPUT", False)
-    get_settings().set("CONFIG.PUBLISH_OUTPUT_PROGRESS", False)
+    """Use the same policy boundary as other verbs; preserve literal question text."""
+    from pr_agent.agent.pr_agent import PRAgent
+    settings = get_settings()
+    settings.set("data.answer", "")
+    propagate_before = settings.get("CONFIG.PROPAGATE_TOOL_ERRORS", False)
     try:
-        q = PRQuestions(target, args=[question])
-        await q.run()
-    except Exception:
-        get_logger().exception("MOSAICO: ask path failed")
+        ok = await PRAgent().handle_request(
+            target, ["ask", encode_user_text_arg(question), "--config.publish_output=false",
+                     "--config.publish_output_progress=false", "--config.propagate_tool_errors=true"],
+        )
+    finally:
+        settings.set("CONFIG.PROPAGATE_TOOL_ERRORS", propagate_before)
+    if ok is RequestOutcome.SKIPPED:
+        return RouteResult("Request ignored by policy.", ok=True)
+    if ok is False:
         return RouteResult(_error_fallback("ask"), ok=False)
-    answer = (q.prediction or "").strip()
+    answer = (settings.get("data.answer", "") or "").strip()
     return RouteResult(answer, ok=True) if answer else RouteResult(_empty_fallback("ask"), ok=True)
 
 
 def _simple_languages(files) -> dict:
-    """Best-effort language map (extension -> count) for get_main_pr_language; tolerant
-    of empties (downstream handles an empty dict)."""
+    """Return configured language-name counts, tolerating an empty file list."""
+    language_map = get_settings().get("language_extension_map_org", {}) or {}
+    get_language = build_language_file_matcher(language_map)
     langs = {}
     for f in files:
         name = getattr(f, "filename", "") or ""
-        if "." in name:
-            ext = name.rsplit(".", 1)[1].lower()
-            langs[ext] = langs.get(ext, 0) + 1
+        language = get_language(name)
+        if language:
+            langs[language] = langs.get(language, 0) + 1
     return langs
 
 
@@ -276,6 +357,7 @@ async def _run_on_diff(diff_body: str, verb: str, text: str, title: str, empty_o
         "files": parsed,
         "languages": _simple_languages(parsed),
         "title": title,
+        "source_url": title if not empty_ok else None,
     })
     settings.set("CONFIG.GIT_PROVIDER", "mosaico_diff")
     if verb == "ask":
@@ -283,26 +365,32 @@ async def _run_on_diff(diff_body: str, verb: str, text: str, title: str, empty_o
     return await _run_pr_agent("mosaico://supplied-diff", verb)
 
 
-async def route_and_run_result(user_text: str) -> "RouteResult":
-    """Route inbound text to a pr-agent command and return a RouteResult. Never raises."""
+async def route_and_run_result(user_text: str, *, context_history: list[str] | None = None) -> "RouteResult":
+    """Route inbound text; keep A2A context_history as literal user messages. Never raises."""
     try:
         text = user_text or ""
-        verb = _detect_verb(text)
+        # Keep A2A message boundaries explicit; only parse role labels for a
+        # standalone forwarded conversation blob.
+        if context_history is None:
+            turns = _split_turns(text)
+        else:
+            turns = [_Turn("user", turn) for turn in [*context_history, text]]
+        user_segments = [t.content for t in reversed(turns) if t.is_user] or [text]
+        context_segments = [t.content for t in reversed(turns)] or [text]
 
-        # Path (a): a host PR URL — fetch the public unified diff and route through
-        # the token-free mosaico_diff provider.
-        pr_url = _find_pr_url(text)
-        if pr_url:
-            diff_body = await _fetch_public_diff(pr_url)
-            if not diff_body:
-                return RouteResult(_pr_fetch_failed_fallback(pr_url), ok=False)
-            return await _run_on_diff(diff_body, verb, text, title=pr_url, empty_ok=False)
+        verb = _resolve_verb(user_segments)
+        question = user_segments[0]
 
-        # Path (b): a supplied unified diff.
-        if _looks_like_diff(text):
-            # Detect the verb from the prose only: a '?' in the patch body must not flip review to ask.
-            verb = _detect_verb(_diff_prose(text))
-            return await _run_on_diff(_extract_diff(text), verb, text, title="Supplied diff")
+        for segment in context_segments:
+            pr_url = _find_pr_url(segment)
+            if pr_url:
+                diff_body = await _fetch_public_diff(pr_url)
+                if not diff_body:
+                    return RouteResult(_pr_fetch_failed_fallback(pr_url), ok=False)
+                return await _run_on_diff(diff_body, verb, question, title=pr_url, empty_ok=False)
+
+            if _looks_like_diff(segment):
+                return await _run_on_diff(_extract_diff(segment), verb, question, title="Supplied diff")
 
         # Path (c): free-text with no PR URL and no supplied diff. PRQuestions needs a
         # diff/PR to answer, so return honest guidance rather than a false internal error.
