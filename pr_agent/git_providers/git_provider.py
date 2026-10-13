@@ -284,15 +284,6 @@ def get_git_ssl_env() -> dict[str, str]:
 
 
 class GitProvider(ABC):
-    def should_publish_review_as_thread(self) -> bool:
-        """Whether the review's final comment can be posted as a resolvable thread.
-
-        Default False. Providers that support resolvable threads (GitLab) override it.
-        Added because pr_reviewer.py calls this unconditionally; without a base
-        definition every GitHub review aborts with AttributeError.
-        """
-        return False
-
     def get_request_policy_metadata(self, required_fields: set[str]) -> dict:
         """Return policy fields; None means unknown, empty values mean not applicable.
 
@@ -922,6 +913,12 @@ class GitProvider(ABC):
         pass
 
     def should_publish_review_as_thread(self) -> bool:
+        """Whether the review's final comment can be posted as a resolvable thread.
+
+        Default False. Providers that support resolvable threads (GitLab) override it.
+        Added because pr_reviewer.py calls this unconditionally; without a base
+        definition every GitHub review aborts with AttributeError.
+        """
         return False
 
     def should_publish_improve_as_thread(self) -> bool:
