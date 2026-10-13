@@ -382,7 +382,13 @@ class PRReviewer:
             # concerns, dismiss the bot's own prior CHANGES_REQUESTED reviews so the PR
             # can become mergeable again. Only the bot's own reviews are ever dismissed.
             if self._review_has_no_key_issues_or_security_concerns():
-                self.git_provider.dismiss_stale_changes_requested_reviews()
+                # Guarded for providers (and test doubles) that predate the method; the
+                # GitProvider base class defines it as a no-op, so real providers always have it.
+                dismiss_stale = getattr(
+                    self.git_provider, "dismiss_stale_changes_requested_reviews", None
+                )
+                if callable(dismiss_stale):
+                    dismiss_stale()
             should_publish = get_settings().config.publish_output and (
                 self._should_publish_review_no_suggestions(pr_review)
                 or state_changed
