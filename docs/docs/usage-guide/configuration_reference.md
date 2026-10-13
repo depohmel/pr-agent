@@ -137,6 +137,8 @@ to-do list.
 | `enable_claude_adaptive_thinking` | false | Adaptive thinking for Claude Opus 4.7/4.8 and Claude 5 models. When enabled, these models receive thinking={"type": "adaptive"} and an output_config effort. Do not add adaptive-only models to claude_extended_thinking_models_override; when both features are enabled, adaptive thinking takes precedence. |
 | `claude_adaptive_thinking_models_override` | [] | Optional: list model ids to additionally treat as adaptive-only Claude models. Add opaque Bedrock application inference profile ARNs here while keeping built-in detection for named models. When adaptive thinking is enabled, use the exact request model ids so LiteLLM keeps the adaptive payload instead of converting it to the legacy budget_tokens shape. |
 | `claude_extended_thinking_models_override` | [] | Optional: override the built-in list of Claude models that receive the extended-thinking payload. When non-empty, this list fully replaces the built-in defaults (see CLAUDE_EXTENDED_THINKING_MODELS in pr_agent/algo/__init__.py). Leave empty to use the defaults. |
+| `nemotron_reasoning_models` | ["openai/large", "openai/large-reviewer"] | Nemotron reasoning models (LiteLLM model names) that need a system prompt trigger to enable reasoning mode. The trigger text is prepended to the system prompt. |
+| `nemotron_reasoning_trigger` | "detailed thinking on" |  |
 | `extract_issue_from_branch` | true | Extract issue number from PR source branch name (e.g. feature/1-auth-google -> issue #1). When true, branch-derived issue URLs are merged with tickets from the PR description for compliance. Set to false to restore description-only behaviour. Note: Branch-name extraction is GitHub-only for now; other providers planned for later. |
 | `branch_issue_regex` | "" | Optional: custom regex with exactly one capturing group for the issue number (validated at runtime; falls back to default if missing). If empty, uses default pattern: first 1-6 digits at start of branch or after a slash, followed by hyphen or end (e.g. feature/1-test, 123-fix). GitHub only; other providers planned for later. |
 | `description_issue_regex` | "" | Configure a regex replacing bare #N references, with exactly one capturing group for an ASCII issue number. Leave empty for default matching (up to six digits); fall back with a warning on invalid patterns. Set the custom digit limit in the pattern; use only integer-parseable captures. Keep full URLs and owner/repo#N references. Use TOML literal quotes to preserve backslashes, e.g. description_issue_regex = '(?i)(?:fixes\|closes\|resolves)\s+#(\d+)' |
@@ -201,6 +203,11 @@ verify the status-changing actor or historical defaults. Dismissed findings shar
 | `enable_review_coverage_footer` | true |  |
 | `enable_large_pr_chunking` | false | large-diff chunking (opt-in). When the token budget leaves files out of the review, split the diff into chunks, review each chunk, and merge the per-chunk results into one review. |
 | `max_number_of_calls` | 3 | maximum number of chunk review calls, used only when enable_large_pr_chunking is true |
+**review gate**
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `enable_review_gate` | false | When true, the reviewer will post a formal GitHub review (APPROVE or REQUEST_CHANGES) based on the verdict. |
 
 
 ## `[pr_description]` — /describe {#pr_description-describe}
