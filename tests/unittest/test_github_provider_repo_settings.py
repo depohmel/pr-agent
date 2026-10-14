@@ -13,6 +13,62 @@ def _provider_with_repo(repo_obj):
     return provider
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://api.github.com/repos/owner/repo/pulls/12", ("owner/repo", 12)),
+        ("https://github.com/owner/repo/pull/12", ("owner/repo", 12)),
+        ("https://github.example.com/api/v3/repos/owner/repo/pulls/12", ("owner/repo", 12)),
+    ],
+)
+def test_parse_pr_url_accepts_github_api_forms(url, expected):
+    provider = GithubProvider.__new__(GithubProvider)
+
+    assert provider._parse_pr_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://api.github.com/repos/owner/repo/issues/12", ("owner/repo", 12)),
+        ("https://github.com/owner/repo/issues/12", ("owner/repo", 12)),
+        ("https://github.example.com/api/v3/repos/owner/repo/issues/12", ("owner/repo", 12)),
+    ],
+)
+def test_parse_issue_url_accepts_github_api_forms(url, expected):
+    provider = GithubProvider.__new__(GithubProvider)
+
+    assert provider._parse_issue_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://notapi.github.com/repos/owner/repo/pulls/12",
+        "https://github.com/owner/api/v3/repo/pulls/12",
+    ],
+)
+def test_parse_pr_url_does_not_treat_host_or_repo_substrings_as_api_url(url):
+    provider = GithubProvider.__new__(GithubProvider)
+
+    with pytest.raises(ValueError):
+        provider._parse_pr_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://notapi.github.com/repos/owner/repo/issues/12",
+        "https://github.com/owner/api/v3/repo/issues/12",
+    ],
+)
+def test_parse_issue_url_does_not_treat_host_or_repo_substrings_as_api_url(url):
+    provider = GithubProvider.__new__(GithubProvider)
+
+    with pytest.raises(ValueError):
+        provider._parse_issue_url(url)
+
+
 @pytest.fixture(autouse=True)
 def no_global_settings():
     # Patch get_settings in git_provider, where get_config_branch() lives, and keep the
