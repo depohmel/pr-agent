@@ -53,7 +53,7 @@ def restore_prompt_settings():
 
 def test_shared_diff_hunk_source_accepts_only_variant_flags():
     source = get_settings().prompt_fragments.diff_hunk_format
-    environment = Environment()
+    environment = Environment(autoescape=True)
 
     assert meta.find_undeclared_variables(environment.parse(source)) == {
         "include_line_numbers",
@@ -97,7 +97,7 @@ def test_render_diff_hunk_format_variants(include_line_numbers, include_ai_metad
 )
 def test_affected_templates_delegate_to_shared_fragment_once(prompt_name, legacy_example):
     system_prompt = get_settings().get(prompt_name).system
-    parsed = Environment().parse(system_prompt)
+    parsed = Environment(autoescape=True).parse(system_prompt)
     fragment_references = [
         node for node in parsed.find_all(nodes.Name) if node.name == "diff_hunk_format"
     ]
@@ -145,7 +145,7 @@ def test_suggestion_prompts_allow_dependencies_introduced_by_improved_code(promp
         "repo_context": "",
     }
 
-    rendered = Environment().from_string(prompt).render(variables)
+    rendered = Environment(autoescape=True).from_string(prompt).render(variables)
 
     assert "If the suggested `improved_code` introduces a dependency" in rendered
     assert "standalone or unrelated missing" in rendered
@@ -154,7 +154,7 @@ def test_suggestion_prompts_allow_dependencies_introduced_by_improved_code(promp
 def test_reflection_prompt_does_not_zero_required_imports():
     prompt = get_settings().pr_code_suggestions_reflect_prompt.system
 
-    rendered = Environment().from_string(prompt).render({"diff_hunk_format": "diff"})
+    rendered = Environment(autoescape=True).from_string(prompt).render({"diff_hunk_format": "diff"})
 
     assert "- Add standalone or unrelated missing import statements" in rendered
     assert "- Add missing import statements" not in rendered
@@ -280,7 +280,7 @@ async def test_reflection_supplies_the_numbered_fragment(
 
 def test_non_decoupled_suggestions_prompt_remains_out_of_scope():
     section = get_settings().pr_code_suggestions_prompt_not_decoupled
-    environment = Environment()
+    environment = Environment(autoescape=True)
 
     system_variables = meta.find_undeclared_variables(environment.parse(section.system))
     user_variables = meta.find_undeclared_variables(environment.parse(section.user))
