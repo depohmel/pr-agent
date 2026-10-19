@@ -289,10 +289,12 @@ MAX_TOKENS = {
     'vertex_ai/gemini-3.1-pro': 1048576,
     'vertex_ai/gemini-3.5-pro': 1048576,
     'vertex_ai/gemini-3.8-flash': 1048576,  # kept pinned: absent from LiteLLM's bundled cost map
+    'vertex_ai/gemini-4-argon': 1048576,  # kept pinned: absent from LiteLLM's bundled cost map
     'gemini/gemini-3.1-flash': 1048576,
     'gemini/gemini-3.1-pro': 1048576,
     'gemini/gemini-3.5-pro': 1048576,
     'gemini/gemini-3.8-flash': 1048576,  # kept pinned: absent from LiteLLM's bundled cost map
+    'gemini/gemini-4-argon': 1048576,  # kept pinned: absent from LiteLLM's bundled cost map
     # -- Bedrock Claude ----------------------------------------------------
     'bedrock/anthropic.claude-sonnet-4-20250514-v1:0': 200000,
     # -- Bedrock Claude (cross-region) -------------------------------------
@@ -390,4 +392,12 @@ CLAUDE_EXTENDED_THINKING_MODELS = list(_claude_extended_thinking)
 # Models that require streaming mode
 STREAMING_REQUIRED_MODELS = [
     "openai/qwq-plus"
+]
+
+# Nemotron reasoning models that require a system prompt trigger to enable reasoning.
+# These models (e.g., Nemotron 3 Ultra via LiteLLM) only activate reasoning when the
+# system message begins with a specific trigger phrase.
+NEMOTRON_REASONING_MODELS = [
+    "openai/large",
+    "openai/large-reviewer",
 ]

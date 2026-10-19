@@ -177,6 +177,7 @@ PROVIDER_SETTING_PATHS = {
     "codestral": {"api_key": "CODESTRAL.KEY"},
     "cohere": {"api_key": "COHERE.KEY"},
     "cohere_chat": {"api_key": "COHERE.KEY"},
+    "compactifai": {"api_key": "COMPACTIFAI.KEY"},
     "dashscope": {"api_key": "DASHSCOPE.KEY"},
     "databricks": {"api_key": "DATABRICKS.API_KEY", "api_base": "DATABRICKS.API_BASE"},
     "deepinfra": {"api_key": "DEEPINFRA.KEY"},
@@ -292,7 +293,13 @@ def _should_retry_same_model(exc: BaseException) -> bool:
     An empty, length-truncated response is deterministic for the same request and cap, so it is
     not replayed unless config.retry_same_model_on_length enables it.
     """
-    if isinstance(exc, (openai.RateLimitError, openai.BadRequestError, openai.UnprocessableEntityError)):
+    if isinstance(exc, (
+        openai.RateLimitError,
+        openai.BadRequestError,
+        openai.UnprocessableEntityError,
+        openai.AuthenticationError,
+        openai.PermissionDeniedError,
+    )):
         return False
     if isinstance(exc, openai.APITimeoutError):
         return _as_bool(get_settings().config.get("retry_same_model_on_timeout", True), default=True)
@@ -2459,6 +2466,28 @@ class LiteLLMAIHandler(BaseAiHandler):
 
         return kwargs
 
+    def _apply_nemotron_trigger(self, model: str, system: str) -> str:
+        """
+        Apply Nemotron reasoning trigger to system prompt if model is a Nemotron reasoning model.
+
+        Nemotron models (e.g., Nemotron 3 Ultra via LiteLLM names "openai/large",
+        "openai/large-reviewer") only enable reasoning when the system message
+        starts with a specific trigger phrase.
+
+        Args:
+            model (str): The AI model being used
+            system (str): The system prompt
+
+        Returns:
+            str: System prompt with trigger prepended if applicable
+        """
+        trigger = get_settings().config.get("nemotron_reasoning_trigger", "")
+        if system is None:
+            system = ""
+        if model in get_settings().config.get("nemotron_reasoning_models", []) and not system.startswith(trigger):
+            return f"{trigger}\n\n{system}"
+        return system
+
     @staticmethod
     def _validated_model_name_list(setting_name: str, settings=None) -> list[str]:
         """Return a stripped config list of model names, or an empty list when malformed."""
@@ -2771,7 +2800,10 @@ class LiteLLMAIHandler(BaseAiHandler):
 
         try:
             timeout = aiohttp.ClientTimeout(total=_IMAGE_HEAD_TIMEOUT_SECONDS)
-            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with (
+                asyncio.timeout(_IMAGE_HEAD_TIMEOUT_SECONDS),
+                aiohttp.ClientSession(timeout=timeout, trust_env=True) as session,
+            ):
                 status = await with_safe_redirects(session, img_path, _status, method="HEAD")
         except Exception as e:
             get_logger().error(f"Error fetching image: {img_path}", e)
@@ -2976,6 +3008,8 @@ class LiteLLMAIHandler(BaseAiHandler):
                         }
                     model_family = "GPT-6" if is_gpt6_model else "GPT-5"
                     get_logger().info(f"Using reasoning_effort='{effort}' for {model_family} model")
+                # Apply Nemotron reasoning trigger on the normal path (not user_message_only/custom_reasoning_model)
+                system = self._apply_nemotron_trigger(model, system)
                 # Currently, some models do not support a separate system and user prompts
                 if self._uses_user_message_only(model) or get_settings().config.custom_reasoning_model:
                     user = f"{system}\n\n\n{user}"

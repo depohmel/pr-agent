@@ -1,4 +1,5 @@
 import json
+import math
 import pathlib
 import posixpath
 import re
@@ -10,7 +11,6 @@ import uuid
 from collections import Counter, namedtuple
 from pathlib import Path
 from tempfile import mkdtemp
-from typing import Optional
 
 import requests
 import urllib3.util
@@ -26,21 +26,43 @@ from pr_agent.git_providers.local_git_provider import PullRequestMimic
 from pr_agent.git_providers.request_timeout import get_http_request_timeout
 from pr_agent.log import get_logger
 
+DEFAULT_GERRIT_COMMAND_TIMEOUT = 120.0
 
-def _call(*command, **kwargs) -> (int, str, str):
-    res = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=True,
-        **kwargs,
-    )
+
+class GerritCommandTimeoutError(TimeoutError):
+    """A direct Gerrit child exceeded its configured deadline."""
+
+
+def _get_command_timeout() -> float:
+    value = get_settings().get("gerrit.command_timeout_seconds", DEFAULT_GERRIT_COMMAND_TIMEOUT)
+    try:
+        timeout = 0.0 if isinstance(value, bool) else float(value)
+    except (TypeError, ValueError, OverflowError):
+        timeout = 0.0
+    if not math.isfinite(timeout) or timeout <= 0:
+        get_logger().warning("Ignoring invalid gerrit.command_timeout_seconds; using the default")
+        return DEFAULT_GERRIT_COMMAND_TIMEOUT
+    return timeout
+
+
+def _call(*command, operation: str, **kwargs) -> str:
+    timeout = _get_command_timeout()
+    try:
+        res = subprocess.run(
+            command,
+            capture_output=True,
+            check=True,
+            timeout=timeout,
+            **kwargs,
+        )
+    except subprocess.TimeoutExpired:
+        raise GerritCommandTimeoutError(f"Gerrit {operation} timed out after {timeout:g} seconds") from None
     return res.stdout.decode()
 
 
 def clone(url, directory):
     get_logger().info("Cloning {} to {}", redact_credentials(url), directory)
-    stdout = _call('git', 'clone', "--depth", "1", url, directory)
+    stdout = _call('git', 'clone', "--depth", "1", url, directory, operation="clone")
     get_logger().info(stdout)
 
 
@@ -48,25 +70,25 @@ def fetch(url, refspec, cwd):
     get_logger().info("Fetching {} {}", redact_credentials(url), refspec)
     stdout = _call(
         'git', 'fetch', '--depth', '2', url, refspec,
-        cwd=cwd
+        cwd=cwd, operation="fetch"
     )
     get_logger().info(stdout)
 
 
 def checkout(cwd):
     get_logger().info("Checking out")
-    stdout = _call('git', 'checkout', "FETCH_HEAD", cwd=cwd)
+    stdout = _call('git', 'checkout', "FETCH_HEAD", cwd=cwd, operation="checkout")
     get_logger().info(stdout)
 
 
 def show(*args, cwd=None):
     get_logger().info("Show")
-    return _call('git', 'show', *args, cwd=cwd)
+    return _call('git', 'show', *args, cwd=cwd, operation="show")
 
 
 def diff(*args, cwd=None):
     get_logger().info("Diff")
-    patch = _call('git', 'diff', *args, cwd=cwd)
+    patch = _call('git', 'diff', *args, cwd=cwd, operation="diff")
     if not patch:
         get_logger().warning("No changes found")
         return
@@ -75,7 +97,7 @@ def diff(*args, cwd=None):
 
 def reset_local_changes(cwd):
     get_logger().info("Reset local changes")
-    _call('git', 'checkout', "--force", cwd=cwd)
+    _call('git', 'checkout', "--force", cwd=cwd, operation="reset")
 
 
 def add_comment(url: urllib3.util.Url, refspec, message):
@@ -88,7 +110,7 @@ def add_comment(url: urllib3.util.Url, refspec, message):
         "gerrit", "review",
         "--message", message,
         # "--code-review", score,
-        f"{patchset},{changenum}",
+        f"{patchset},{changenum}", operation="review",
     )
 
 
@@ -101,7 +123,7 @@ def list_comments(url: urllib3.util.Url, refspec):
         "gerrit", "query",
         "--comments",
         "--current-patch-set", patchset,
-        "--format", "JSON",
+        "--format", "JSON", operation="query",
     )
     change_set, *_ = stdout.splitlines()
     return json.loads(change_set)["currentPatchSet"]["comments"]
@@ -181,7 +203,7 @@ def adopt_to_gerrit_message(message):
 def add_suggestion(src_filename, context: str, start, end: int):
     # Rewrite the file in place with its own line endings, so the patch built from
     # `git diff` holds only the suggestion: no CRLF-to-LF rewrite and no mode change.
-    with open(src_filename, "r", encoding="utf-8", newline="") as src:
+    with open(src_filename, encoding="utf-8", newline="") as src:
         lines = src.readlines()
     # Match the ending of the first replaced line, falling back to the first line.
     anchor = lines[start - 1] if 0 < start <= len(lines) else (lines[0] if lines else "")
@@ -267,7 +289,7 @@ class GerritProvider(GitProvider):
         raise NotImplementedError(
             'Getting labels is not implemented for the gerrit provider')
 
-    def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False) -> Optional[int]:
+    def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False) -> int | None:
         raise NotImplementedError(
             'Adding reactions is not implemented for the gerrit provider')
 

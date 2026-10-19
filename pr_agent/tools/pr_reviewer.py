@@ -3,7 +3,6 @@ import copy
 import datetime
 import re
 from functools import partial
-from typing import List, Optional, Tuple
 
 from pydantic import ValidationError
 
@@ -283,7 +282,7 @@ class PRReviewer:
             get_settings().pr_review_prompt.user
         )
 
-    def parse_incremental(self, args: List[str]):
+    def parse_incremental(self, args: list[str]):
         is_incremental = False
         if args and len(args) >= 1:
             arg = args[0]
@@ -376,6 +375,18 @@ class PRReviewer:
             state_result = getattr(self, "_review_state_result", None)
             state_changed = bool(state_result and state_result.changed)
             state_blocked = getattr(self, "_review_state_blocked", False)
+            # When a fresh review of the current head finds no key issues and no security
+            # concerns, dismiss the bot's own prior CHANGES_REQUESTED reviews so the PR
+            # can become mergeable again. Only the bot's own reviews are ever dismissed.
+            if self._review_has_no_key_issues_or_security_concerns():
+                # Guarded for providers (and test doubles) that predate the method; the
+                # GitProvider base class defines it as a no-op, so real providers always have it.
+                dismiss_stale = getattr(
+                    self.git_provider, "dismiss_stale_changes_requested_reviews", None
+                )
+                if callable(dismiss_stale):
+                    dismiss_stale()
+
             should_publish = get_settings().config.publish_output and (
                 self._should_publish_review_no_suggestions(pr_review)
                 or state_changed
@@ -487,6 +498,25 @@ class PRReviewer:
                     )
                     pr_review = add_pr_review_identity(pr_review, identity_marker, self.git_provider)
                 self.git_provider.publish_comment(pr_review, **review_thread_kwargs)
+
+            # Review gate: post a formal GitHub review if enabled
+            if get_settings().pr_reviewer.get("enable_review_gate", False):
+                # Check if we are using GitHub provider
+                if self.git_provider.__class__.__name__ == "GithubProvider":
+                    event, body = self._get_review_gate_decision()
+                    if event == "APPROVE":
+                        try:
+                            self.git_provider.create_review(event="APPROVE")
+                            get_logger().info("Review gate: APPROVED")
+                        except Exception as e:
+                            get_logger().exception(f"Failed to post APPROVE review: {e}")
+                    elif event == "REQUEST_CHANGES":
+                        try:
+                            self.git_provider.request_changes(body)
+                            get_logger().info("Review gate: REQUEST_CHANGES")
+                        except Exception as e:
+                            get_logger().exception(f"Failed to post REQUEST_CHANGES review: {e}")
+
         except Exception as e:
             review_error = e
             review_failed = True
@@ -608,7 +638,7 @@ class PRReviewer:
             and implementation is not GitProvider.supports_review_finding_state
         )
 
-    def _persistent_review_comment_exists(self) -> Optional[bool]:
+    def _persistent_review_comment_exists(self) -> bool | None:
         """Whether a comment already carries the full-review identity.
 
         Returns None when the provider's comments could not be read at all, so a caller
@@ -717,7 +747,7 @@ class PRReviewer:
         return dismissed
 
     @staticmethod
-    def _review_finding_from_issue(issue: dict) -> Optional[dict]:
+    def _review_finding_from_issue(issue: dict) -> dict | None:
         if not isinstance(issue, dict):
             return None
         path = str(issue.get("relevant_file") or issue.get("path") or "").strip()
@@ -741,7 +771,7 @@ class PRReviewer:
         return finding
 
     @classmethod
-    def _review_findings_from_data(cls, data: dict) -> Optional[list[dict]]:
+    def _review_findings_from_data(cls, data: dict) -> list[dict] | None:
         review = data.get("review")
         if not isinstance(review, dict):
             return None
@@ -875,6 +905,22 @@ class PRReviewer:
             get_settings().pr_reviewer.get('publish_output_no_suggestions', True)
             or "No major issues detected" not in pr_review
         )
+
+    def _review_has_no_key_issues_or_security_concerns(self) -> bool:
+        """Return True when the parsed review found no key issues and no security concerns.
+
+        Mirrors the same heuristic used by ``set_review_labels``: an empty/
+        missing ``key_issues_to_review`` list and a ``security_concerns`` string
+        that does not contain "yes" or "true".
+        """
+        review = (getattr(self, "review_data", None) or {}).get("review") or {}
+        key_issues = review.get("key_issues_to_review")
+        has_key_issues = bool(key_issues) if isinstance(key_issues, list) else False
+        security_concerns = review.get("security_concerns") or ""
+        has_security = (
+            "yes" in security_concerns.lower() or "true" in security_concerns.lower()
+        )
+        return not has_key_issues and not has_security
 
     async def _prepare_prediction(self, model: str) -> None:
         # Each model attempt owns a fresh result. A malformed primary must not
@@ -1163,7 +1209,13 @@ class PRReviewer:
         raw_predictions = [chunk_results[index][0] for index in indices]
         chunk_outputs = [chunk_results[index][1] for index in indices]
         self.prediction = "\n".join(raw_predictions)
-        self.prediction_data = merge_review_chunks(chunk_outputs)
+        try:
+            max_findings = int(get_settings().pr_reviewer.num_max_findings)
+        except (TypeError, ValueError):
+            max_findings = None
+        raw_vars = getattr(self, "_raw_prompt_vars", None) or getattr(self, "vars", None) or {}
+        self.prediction_data = merge_review_chunks(
+            chunk_outputs, related_tickets=raw_vars.get("related_tickets"), max_findings=max_findings)
         self.review_chunk_count = len(self._chunked_patches_diff_list)
         self.review_failed_chunk_count = self.review_chunk_count - len(chunk_results)
         self.remaining_files_list = self._chunked_remaining_files_list
@@ -1185,7 +1237,7 @@ class PRReviewer:
             if progress is not None:
                 await progress.record_settled()
 
-    async def _get_prediction(self, model: str, patches_diff: Optional[str] = None) -> str:
+    async def _get_prediction(self, model: str, patches_diff: str | None = None) -> str:
         """
         Generate an AI prediction for the pull request review.
 
@@ -1331,6 +1383,9 @@ class PRReviewer:
             key_issues_to_review = data['review'].pop('key_issues_to_review')
             data['review']['key_issues_to_review'] = key_issues_to_review
 
+        # Store the parsed data for potential use in the review gate
+        self.parsed_review_data = data
+
         self._prepare_review_finding_state(data)
         if get_settings().config.publish_output and get_settings().pr_reviewer.get('inline_key_issues', False):
             data = self._publish_key_issues_as_inline_comments(data)
@@ -1343,9 +1398,9 @@ class PRReviewer:
             incremental_review_markdown_text = f"Starting from commit {last_commit_url}"
 
         markdown_text = convert_to_markdown_v2(data, self.git_provider.is_supported("gfm_markdown"),
-                                            incremental_review_markdown_text,
-                                               git_provider=self.git_provider,
-                                               files=self.git_provider.get_diff_files())
+                                             incremental_review_markdown_text,
+                                                git_provider=self.git_provider,
+                                                files=self.git_provider.get_diff_files())
 
         if self.review_chunk_count > 1:
             markdown_text += (
@@ -1434,8 +1489,71 @@ class PRReviewer:
             markdown_text = ""
 
         return markdown_text
+    def _get_review_gate_decision(self):
+        """
+        Determine the review gate decision based on the parsed review data.
+        Returns a tuple (event, body) where event is either "APPROVE" or "REQUEST_CHANGES",
+        and body is the review body (for REQUEST_CHANGES) or None (for APPROVE).
+        Returns (None, None) if the gate is disabled or if we cannot determine.
+        """
+        if not get_settings().pr_reviewer.get("enable_review_gate", False):
+            return (None, None)
 
-    def _build_key_issue_comment(self, issue, diff_files: dict) -> Optional[dict]:
+        review_data = getattr(self, 'parsed_review_data', {})
+        review_section = review_data.get('review', {})
+        key_issues = review_section.get('key_issues_to_review', [])
+        security_concerns = review_section.get('security_concerns', '')
+
+        # Normalize key_issues: treat None, empty string, "[]", "{}" as empty list.
+        # Also, if it's a string that is not one of the empty representations, we wrap it in a
+        # list to avoid iterating over characters.
+        if key_issues is None:
+            key_issues = []
+        elif isinstance(key_issues, str):
+            stripped = key_issues.strip()
+            if stripped in ["", "[]", "{}"]:
+                key_issues = []
+            else:
+                # Wrap the string in a list so we can iterate safely (one element)
+                key_issues = [key_issues]
+        elif not isinstance(key_issues, list):
+            # If it's not a list or string, wrap in a list (e.g., if it's a dict, int, etc.)
+            key_issues = [key_issues]
+
+        # Normalize security_concerns to string safely
+        if security_concerns is None:
+            security_concerns_str = ''
+        else:
+            security_concerns_str = str(security_concerns)
+        security_concerns_bool = 'yes' in security_concerns_str.lower() or 'true' in security_concerns_str.lower()
+
+        if not key_issues and not security_concerns_bool:
+            return ("APPROVE", None)
+        else:
+            # Prepare a summary of the issues
+            issue_summary = []
+            if key_issues:
+                issue_summary.append("### Key Issues Found")
+                for issue in key_issues:
+                    if isinstance(issue, dict):
+                        relevant_file = issue.get('relevant_file', 'N/A')
+                        issue_header = issue.get('issue_header', 'Issue')
+                        issue_content = issue.get('issue_content', 'No description')
+                        issue_summary.append(f"- **{issue_header}** ({relevant_file}): {issue_content}")
+                    else:
+                        # If it's not a dict, convert to string
+                        issue_summary.append(f"- {str(issue)}")
+            if security_concerns_bool:
+                issue_summary.append("\n### Security Concern")
+                issue_summary.append("The review flagged a possible security concern that needs to be addressed.")
+
+            body = "\n".join(issue_summary)
+            if not body:
+                body = "The review found issues that need to be addressed before merging."
+            return ("REQUEST_CHANGES", body)
+
+
+    def _build_key_issue_comment(self, issue, diff_files: dict) -> dict | None:
         if not isinstance(issue, dict):
             return None
         relevant_file = (issue.get("relevant_file") or "").strip()
@@ -1582,9 +1700,9 @@ class PRReviewer:
             data["review"].pop("key_issues_to_review", None)
         return data
 
-    def _get_user_answers(self) -> Tuple[str, str]:
+    def _get_user_answers(self) -> tuple[str, str]:
         """
-        Retrieves the question and answer strings from the discussion messages related to a pull request.
+        Retrieves the newest question and any answer posted after it from pull-request comments.
 
         Returns:
             A tuple containing the question and answer strings.
@@ -1595,22 +1713,14 @@ class PRReviewer:
         if self.is_answer and self.git_provider.is_supported("get_issue_comments"):
             # __init__ already raises when is_answer is True and this is unsupported, so
             # this repeats that check locally rather than relying on the caller for it.
-            discussion_messages = self.git_provider.get_issue_comments()
-
-            # providers return the comments oldest-first. PyGithub's PaginatedList reverses lazily,
-            # so prefer it and only materialise the plain lists other providers return.
-            newest_first = getattr(discussion_messages, "reversed", None)
-            if newest_first is None:
-                newest_first = reversed(list(discussion_messages))
+            newest_first = self.git_provider.get_issue_comments_newest_first()
 
             for message in newest_first:
                 if "Questions to better understand the PR:" in message.body:
                     question_str = message.body
-                elif '/answer' in message.body:
-                    answer_str = message.body
-
-                if answer_str and question_str:
                     break
+                if not answer_str and '/answer' in message.body:
+                    answer_str = message.body
 
         return question_str, answer_str
 
@@ -1639,7 +1749,7 @@ class PRReviewer:
         not_enough_commits = num_new_commits < num_commits_threshold
         # checking if the commits are not too recent to start the review
         recent_commits_threshold = (
-            datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
             - datetime.timedelta(minutes=get_settings().pr_reviewer.minimal_minutes_for_incremental_review)
         )
         last_seen_commit_date = (
@@ -1649,7 +1759,7 @@ class PRReviewer:
         # naive datetime. Normalize to naive UTC so the comparison cannot raise
         # TypeError, matching how the GitLab and Azure providers emit commit dates.
         if last_seen_commit_date is not None and last_seen_commit_date.tzinfo is not None:
-            last_seen_commit_date = last_seen_commit_date.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            last_seen_commit_date = last_seen_commit_date.astimezone(datetime.UTC).replace(tzinfo=None)
         all_commits_too_recent = (
             last_seen_commit_date > recent_commits_threshold if self.incremental.last_seen_commit else False
         )

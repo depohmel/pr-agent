@@ -144,8 +144,25 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
 
+      # This workflow originates from the upstream repo, where QODO_SPONSORSHIP_LLM_KEY is a
+      # Qodo-provided sponsored key that the fork does not have. Without it the gateway call
+      # fails (received=dummy_key, expected sk-), so skip the run when the secret is unset
+      # instead of failing the PR check; set the secret to enable sponsored PR-Agent runs.
+      # The secrets context is not available in step `if`, so probe it through step outputs.
+      - name: Detect sponsored key
+        id: sponsored-key
+        env:
+          SPONSORED_KEY: ${{ secrets.QODO_SPONSORSHIP_LLM_KEY }}
+        run: |
+          if [ -n "$SPONSORED_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::QODO_SPONSORSHIP_LLM_KEY is not configured; skipping sponsored PR-Agent run."
+          fi
+
       - name: Run sponsored PR-Agent
-        if: steps.authorize.outputs.allowed == 'true'
+        if: steps.authorize.outputs.allowed == 'true' && steps.sponsored-key.outputs.available == 'true'
         uses: docker://pragent/pr-agent:github_action
         with:
           entrypoint: /bin/sh
@@ -168,10 +185,18 @@ jobs:
           CONFIG__MAX_OUTPUT_TOKENS: '8192'
           CONFIG__LOG_LEVEL: INFO
           CONFIG__OUTPUT_RUN_DETAILS: 'true'
+          # The action would also merge this repo's own .pr_agent.toml, whose `synchronize`
+          # push command points at /agentic_review - not in OSS, so it would fail the job.
+          CONFIG__USE_REPO_SETTINGS_FILE: 'false'
           # Write the generated description into the PR body, keeping the author's text in it.
           PR_DESCRIPTION__PUBLISH_DESCRIPTION_AS_COMMENT: 'false'
           PR_DESCRIPTION__ADD_ORIGINAL_USER_DESCRIPTION: 'true'
+          # The default "only critical problems" filter returns an empty list on most PRs here,
+          # which made 90 of 99 /improve comments say "No code suggestions found" (#4161).
+          PR_CODE_SUGGESTIONS__FOCUS_ONLY_ON_PROBLEMS: 'false'
+          # With suggestions flowing again, drop the empty-list comments instead of posting them.
+          PR_CODE_SUGGESTIONS__PUBLISH_OUTPUT_NO_SUGGESTIONS: 'false'
           GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: 'true'
-          GITHUB_ACTION_CONFIG__AUTO_REVIEW: 'false'
+          GITHUB_ACTION_CONFIG__AUTO_REVIEW: 'true'
           GITHUB_ACTION_CONFIG__AUTO_IMPROVE: 'true'
           GITHUB_ACTION_CONFIG__FAIL_ON_TOOL_ERRORS: 'true'

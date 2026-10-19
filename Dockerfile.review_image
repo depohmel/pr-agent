@@ -1,0 +1,36 @@
+# Dockerfile for building pr-agent from source
+# This Dockerfile builds the pr-agent application from source
+# instead of relying on the unverified base image pragent/pr-agent:0.39.0-github_app
+
+FROM python:3.12.13-slim AS base
+
+# Install system dependencies
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    git \
+    curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt && rm requirements.txt
+
+# Copy the source code
+COPY docs docs
+COPY pr_agent pr_agent
+
+# Install the application in development mode
+COPY pyproject.toml .
+RUN pip install --no-cache-dir -e .
+
+# Set environment variables
+ENV PYTHONPATH=/app
+
+# Copy entrypoint script
+COPY github_action/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Set the entrypoint
+ENTRYPOINT ["/entrypoint.sh"]
