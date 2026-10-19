@@ -144,8 +144,25 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
 
+      # This workflow originates from the upstream repo, where QODO_SPONSORSHIP_LLM_KEY is a
+      # Qodo-provided sponsored key that the fork does not have. Without it the gateway call
+      # fails (received=dummy_key, expected sk-), so skip the run when the secret is unset
+      # instead of failing the PR check; set the secret to enable sponsored PR-Agent runs.
+      # The secrets context is not available in step `if`, so probe it through step outputs.
+      - name: Detect sponsored key
+        id: sponsored-key
+        env:
+          SPONSORED_KEY: ${{ secrets.QODO_SPONSORSHIP_LLM_KEY }}
+        run: |
+          if [ -n "$SPONSORED_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::QODO_SPONSORSHIP_LLM_KEY is not configured; skipping sponsored PR-Agent run."
+          fi
+
       - name: Run sponsored PR-Agent
-        if: steps.authorize.outputs.allowed == 'true'
+        if: steps.authorize.outputs.allowed == 'true' && steps.sponsored-key.outputs.available == 'true'
         uses: docker://pragent/pr-agent:github_action
         with:
           entrypoint: /bin/sh
