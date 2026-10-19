@@ -1,3 +1,8 @@
+---
+title: "Swapping the reviewer image to a fork-built image"
+sidebar_position: 10
+---
+
 # Swapping the reviewer image to a fork-built image
 
 This page is for operators maintaining a **self-hosted pr-agent reviewer** (the
