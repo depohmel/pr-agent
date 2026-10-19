@@ -1505,7 +1505,8 @@ class PRReviewer:
         security_concerns = review_section.get('security_concerns', '')
 
         # Normalize key_issues: treat None, empty string, "[]", "{}" as empty list.
-        # Also, if it's a string that is not one of the empty representations, we wrap it in a list to avoid iterating over characters.
+        # Also, if it's a string that is not one of the empty representations, we wrap it in a
+        # list to avoid iterating over characters.
         if key_issues is None:
             key_issues = []
         elif isinstance(key_issues, str):

@@ -33,7 +33,9 @@ class TestReviewGate(unittest.TestCase):
 
         self.pr_reviewer.parsed_review_data = {
             'review': {
-                'key_issues_to_review': [{"relevant_file": "file.py", "issue_header": "Test", "issue_content": "content"}],
+                'key_issues_to_review': [
+                    {"relevant_file": "file.py", "issue_header": "Test", "issue_content": "content"}
+                ],
                 'security_concerns': 'no'
             }
         }
@@ -232,7 +234,11 @@ class TestReviewGate(unittest.TestCase):
         self.assertIsNotNone(body)
         self.assertIn("### Key Issues Found", body)
         self.assertIn("- **Test Header** (file.py): Test content", body)
-        self.assertNotIn("- {'relevant_file': 'file.py', 'issue_header': 'Test Header', 'issue_content': 'Test content'}", body)
+        raw_dict_repr = (
+            "- {'relevant_file': 'file.py', 'issue_header': 'Test Header', "
+            "'issue_content': 'Test content'}"
+        )
+        self.assertNotIn(raw_dict_repr, body)
         self.assertNotIn("### Security Concern", body)
 
     @patch('pr_agent.tools.pr_reviewer.get_settings')
@@ -315,7 +321,8 @@ class TestReviewGate(unittest.TestCase):
 
         # This should not raise an exception
         event, body = self.pr_reviewer._get_review_gate_decision()
-        # The dict becomes "{'some': 'dict'}" which does not contain 'yes' or 'true' (unless the string representation does by chance)
+        # The dict becomes "{'some': 'dict'}" which does not contain 'yes' or 'true'
+        # (unless the string representation does by chance)
         # So we expect APPROVE if key_issues is empty.
         self.assertEqual(event, "APPROVE")
         self.assertIsNone(body)
